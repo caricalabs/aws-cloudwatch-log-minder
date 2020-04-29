@@ -1,5 +1,8 @@
 import json
+import threading
+from concurrent.futures.thread import ThreadPoolExecutor
 from datetime import datetime, timedelta
+from multiprocessing import Queue
 from typing import List
 
 import boto3
@@ -9,16 +12,41 @@ from botocore.exceptions import ClientError
 from .logger import log
 
 cw_logs = None
+thread_data = threading.local()
 
 
 def ms_to_datetime(ms: int) -> datetime:
     return datetime(1970, 1, 1) + timedelta(milliseconds=ms)
 
 
+def _delete_log_stream_initializer(region: str, profile: str):
+    boto_session = boto3.Session(region_name=region, profile_name=profile)
+    thread_data.cw_logs = boto_session.client(
+        "logs", config=Config(retries=dict(max_attempts=10))
+    )
+
+
+def _delete_log_stream_worker(log_group_name: str, log_stream_name: str):
+    try:
+        thread_data.cw_logs.delete_log_stream(
+            logGroupName=log_group_name, logStreamName=log_stream_name
+        )
+    except ClientError as e:
+        log.error(
+            "failed to delete log stream %s from group %s, %s",
+            log_stream_name,
+            log_group_name,
+            e,
+        )
+
+
 def _delete_empty_log_streams(
-    group: dict, purge_non_empty: bool = False, dry_run: bool = False
+    group: dict,
+    purge_non_empty: bool = False,
+    dry_run: bool = False,
+    executor: ThreadPoolExecutor = None,
 ):
-    now = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    now = datetime.utcnow().replace(hour=1, minute=0, second=0, microsecond=0)
     log_group_name = group["logGroupName"]
     retention_in_days = group.get("retentionInDays", 0)
     if not retention_in_days:
@@ -91,17 +119,7 @@ def _delete_empty_log_streams(
             if dry_run:
                 continue
 
-            try:
-                cw_logs.delete_log_stream(
-                    logGroupName=log_group_name, logStreamName=log_stream_name
-                )
-            except ClientError as e:
-                log.error(
-                    "failed to delete log stream %s from group %s, %s",
-                    log_stream_name,
-                    log_group_name,
-                    e,
-                )
+            executor.submit(_delete_log_stream_worker, log_group_name, log_stream_name)
 
 
 def delete_empty_log_streams(
@@ -110,6 +128,7 @@ def delete_empty_log_streams(
     dry_run: bool = False,
     region: str = None,
     profile: str = None,
+    num_threads: int = 1,
 ):
     global cw_logs
 
@@ -120,10 +139,25 @@ def delete_empty_log_streams(
     if log_group_name_prefix:
         kwargs["logGroupNamePrefix"] = log_group_name_prefix
 
-    log.info("finding log groups with prefix %r", log_group_name_prefix)
-    for response in cw_logs.get_paginator("describe_log_groups").paginate(**kwargs):
-        for group in response["logGroups"]:
-            _delete_empty_log_streams(group, purge_non_empty, dry_run)
+    executor = ThreadPoolExecutor(
+        max_workers=num_threads,
+        initializer=_delete_log_stream_initializer,
+        initargs=(region, profile),
+    )
+
+    error = None
+    try:
+        log.info("finding log groups with prefix %r", log_group_name_prefix)
+        for response in cw_logs.get_paginator("describe_log_groups").paginate(**kwargs):
+            for group in response["logGroups"]:
+                _delete_empty_log_streams(group, purge_non_empty, dry_run, executor)
+    except KeyboardInterrupt as e:
+        error = e
+
+    executor.shutdown(wait=True)
+
+    if error:
+        raise error from error
 
 
 def get_all_log_group_names() -> List[str]:

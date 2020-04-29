@@ -36,18 +36,24 @@ def set_log_retention_command(ctx, days):
     help="of selected log group only",
 )
 @click.option(
+    "--num-threads", type=int, default=1, help="number of threads to use",
+)
+@click.option(
     "--purge-non-empty",
     is_flag=True,
     default=False,
     help="purge non empty streams older than retention period too",
 )
-def delete_empty_log_streams_command(ctx, log_group_name_prefix, purge_non_empty):
+def delete_empty_log_streams_command(
+    ctx, log_group_name_prefix, num_threads, purge_non_empty
+):
     delete_empty_log_streams(
         log_group_name_prefix,
         purge_non_empty,
         ctx.obj["dry_run"],
         ctx.obj["region"],
         ctx.obj["profile"],
+        num_threads,
     )
 
 
